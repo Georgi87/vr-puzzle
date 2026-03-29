@@ -6,7 +6,7 @@ A browser-based 3D jigsaw puzzle game built with Three.js and WebXR. Load any 3D
 
 ### Setup
 
-1. Open the app in your browser at `https://localhost:8443`.
+1. Open the app in your browser at [https://georgi87.github.io/vr-puzzle/](https://georgi87.github.io/vr-puzzle/) on your Quest VR browser or locally at `https://localhost:8443`.
 2. Select a built-in model from the dropdown, or drag and drop your own `.fbx` file onto the scene.
 3. Choose the number of pieces (20 – 1000) and click **Split**.
 
