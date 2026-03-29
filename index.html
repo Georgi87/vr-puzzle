@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VR Puzzle</title>
+  <style>
+    body, html { margin: 0; overflow: hidden; width: 100%; height: 100%; background: #111; }
+    #info { position: absolute; top: 8px; left: 8px; color: #eee; font-family: Inter, sans-serif; font-size: 13px; z-index: 10; background: rgba(0,0,0,.5); padding: 6px 8px; border-radius: 4px; }
+    #spinner { position: absolute; top: 40px; left: 8px; color: #fff; font-family: Inter, sans-serif; font-size: 13px; z-index: 10; background: rgba(0,0,0,.75); padding: 6px 8px; border-radius: 4px; display: none; }
+    #errorModal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.55); z-index: 999; visibility: hidden; opacity: 0; transition: opacity .16s ease-in-out; }
+    #errorModal.visible { visibility: visible; opacity: 1; }
+    #errorModal .card { background: #222; color: #f8f8f8; padding: 18px; width: 320px; border-radius: 8px; font-family: Inter, sans-serif; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+    #errorModal .card button { margin-top: 14px; padding: 6px 12px; background: #ff5252; border: 0; border-radius: 4px; color: #fff; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="ui" style="position:absolute; right: 8px; top: 8px; z-index: 20; background: rgba(0,0,0,.5); border-radius:6px; padding:8px; color:#fff; font-family: Inter, sans-serif; min-width:240px; max-height: calc(100vh - 20px); overflow-y: auto;">
+    <div style="display:grid; grid-gap:6px;">
+      <div style="display:flex; align-items:center; gap:6px;">
+        <label for="modelSelect" style="font-size:13px; white-space:nowrap;">Model:</label>
+        <select id="modelSelect" style="flex:1; background:#fff; color:#000; border-radius:4px; border:1px solid #888; padding:4px;"></select>
+      </div>
+      <label style="font-size:13px;">Load FBX file:
+        <input id="fileInput" type="file" accept=".fbx" style="margin-left:6px;" />
+      </label>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <select id="pieceCount" style="flex:1; background:#fff; color:#000; border-radius:4px; border:1px solid #888; padding:4px;">
+          <option value="20">20 pieces</option>
+          <option value="50" selected>50 pieces</option>
+          <option value="100">100 pieces</option>
+          <option value="500">500 pieces</option>
+          <option value="1000">1000 pieces</option>
+        </select>
+        <button id="splitBtn" style="padding:6px 10px; background:#7b1fa2; border:0; border-radius:4px; color:#fff; cursor:pointer;">Split</button>
+      </div>
+<button id="muteBtn" style="padding:6px 10px; background:#546e7a; border:0; border-radius:4px; color:#fff; cursor:pointer;">Play Music</button>
+<button id="xrBtn" style="padding:6px 10px; background:#e65100; border:0; border-radius:4px; color:#fff; cursor:pointer;">Enter AR (Quest 3)</button>
+      <p style="margin:0; font-size:12px;">or drag/drop .fbx onto scene.</p>
+    </div>
+  </div>
+  <audio id="bgMusic" loop preload="none"></audio>
+  <div id="info"></div>
+  <div id="spinner">Loading …</div>
+  <div id="errorModal">
+    <div class="card">
+      <h3 style="margin-top:0;">Load error</h3>
+      <div id="errorMessage" style="font-size:13px; margin-top:8px;">Unknown error</div>
+      <button id="closeError">Close</button>
+    </div>
+  </div>
+  <script type="module">
+    import * as THREE from './libs/three/build/three.module.js';
+    import { OrbitControls } from './libs/three/examples/jsm/controls/OrbitControls.js';
+    import { FBXLoader } from './libs/three/examples/jsm/loaders/FBXLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1b1b1b);
+
+    // Container for all puzzle content — moved/rotated by XR thumbstick navigation
+    const _xrPivot = new THREE.Group();
+    scene.add(_xrPivot);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 2000);
+    camera.position.set(4, 3, 6);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const light1 = new THREE.DirectionalLight(0xffffff, 1.0);
+    light1.position.set(5, 10, 7);
+    scene.add(light1);
+
+    const light2 = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(light2);
+
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.minDistance = 0.5;
+    controls.maxDistance = 50;
+    const _defaultMouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    const _puzzleMouseButtons  = { LEFT: THREE.MOUSE.PAN,    MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function computeBoundsAndCenter(object) {
+      const box = new THREE.Box3().setFromObject(object);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+      return { box, size, center };
+    }
+
+    const fbxLoader = new FBXLoader();
+    let loadedModel = null;
+    let _masterModel = null; // original FBX — preserved across re-splits
+    let pieces = [];        // piece Groups after split
+    let snapCellSize = 0;   // max cell dimension in assembled space
+    let snapThreshold = 0;  // XZ position tolerance for snapping
+
+    const setInfo = txt => document.getElementById('info').textContent = txt;
+    const spinner = document.getElementById('spinner');
+    const errorModal = document.getElementById('errorModal');
+    const errorMessage = document.getElementById('errorMessage');
+
+    function showSpinner(show) {
+      spinner.style.display = show ? 'block' : 'none';
+    }
+
+    function showError(msg) {
+      errorMessage.textContent = msg;
+      errorModal.classList.add('visible');
+    }
+
+    document.getElementById('closeError').addEventListener('click', () => {
+      errorModal.classList.remove('visible');
+    });
+
+
+    function _disposeObject(obj) {
+      obj.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+          else child.material.dispose();
+        }
+      });
+    }
+
+    function clearModel(disposeAll = false) {
+      if (!loadedModel) return;
+      _xrPivot.remove(loadedModel);
+      // Only dispose geometry/materials if this is NOT the original FBX
+      // (or if explicitly requested, e.g. when loading a new file)
+      if (loadedModel !== _masterModel || disposeAll) {
+        _disposeObject(loadedModel);
+      }
+      if (disposeAll && _masterModel && _masterModel !== loadedModel) {
+        _xrPivot.remove(_masterModel);
+        _disposeObject(_masterModel);
+        _masterModel = null;
+      }
+      loadedModel = null;
+      pieces = [];
+      _pieceMeshes = null;
+      controls.mouseButtons = _defaultMouseButtons;
+    }
+
+    function loadFBX(urlOrArrayBuffer, useArrayBuffer = false, label = 'FBX') {
+      clearModel(true); // dispose old model including master
+      setInfo(`Loading ${label}...`);
+      showSpinner(true);
+
+      const onProgress = xhr => {
+        if (xhr.lengthComputable) {
+          const percent = Math.round((xhr.loaded / xhr.total) * 100);
+          setInfo(`Loading ${label}: ${percent}%`);
+        }
+      };
+
+      const onLoad = object => {
+        const { size, center } = computeBoundsAndCenter(object);
+
+        object.traverse(child => {
+          if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+            if (Array.isArray(child.material)) {
+              child.material.forEach(m => m.side = THREE.DoubleSide);
+            } else {
+              child.material.side = THREE.DoubleSide;
+            }
+          }
+        });
+
+        const maxSize = Math.max(size.x, size.y, size.z);
+        if (maxSize > 0) {
+          const scale = 2 / maxSize;
+          object.scale.setScalar(scale);
+        }
+
+        object.position.sub(center.multiplyScalar(object.scale.x));
+
+        _xrPivot.add(object);
+        loadedModel = object;
+        _masterModel = object; // save original for re-splits
+        setInfo(`Loaded ${label}. Orbit, pan with middle button, zoom with wheel.`);
+        showSpinner(false);
+      };
+
+      const onError = err => {
+        console.error(err);
+        showSpinner(false);
+        setInfo(`Error loading ${label}; check console.`);
+        showError(`Error loading ${label}: ${err?.message || 'unknown'}`);
+      };
+
+      if (useArrayBuffer) {
+        try {
+          const object = fbxLoader.parse(urlOrArrayBuffer, '');
+          onLoad(object);
+        } catch (e) {
+          onError(e);
+        }
+      } else {
+        fbxLoader.load(urlOrArrayBuffer, onLoad, onProgress, onError);
+      }
+    }
+
+    document.getElementById('fileInput').addEventListener('change', event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (!file.name.toLowerCase().endsWith('.fbx')) {
+        setInfo('Please select an .fbx file.');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = e => { loadFBX(e.target.result, true, file.name); selectLocalModel(); };
+      reader.readAsArrayBuffer(file);
+    });
+
+    renderer.domElement.addEventListener('dragover', event => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    });
+
+    renderer.domElement.addEventListener('drop', event => {
+      event.preventDefault();
+      const file = event.dataTransfer.files && event.dataTransfer.files[0];
+      if (!file || !file.name.toLowerCase().endsWith('.fbx')) {
+        document.getElementById('info').textContent = 'Drop a .fbx file here.';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = e => { loadFBX(e.target.result, true, file.name); selectLocalModel(); };
+      reader.readAsArrayBuffer(file);
+    });
+
+    function splitModel(targetPieces = 50) {
+      if (!_masterModel) { setInfo('No model loaded to split.'); return; }
+      showSpinner(true);
+      setInfo('Splitting model…');
+      setTimeout(() => {
+        try {
+          // Re-add master model temporarily so its matrixWorld is correct
+          if (!_xrPivot.children.includes(_masterModel)) {
+            _xrPivot.add(_masterModel);
+          }
+          const worldBox = new THREE.Box3().setFromObject(_masterModel);
+          const worldSize = new THREE.Vector3();
+          worldBox.getSize(worldSize);
+          if (worldSize.x === 0) worldSize.x = 1;
+          if (worldSize.y === 0) worldSize.y = 1;
+          if (worldSize.z === 0) worldSize.z = 1;
+
+          // Binary-search for the scale whose XY grid product is closest to targetPieces.
+          // nz is always 1: the puzzle is 2D (pieces span the full depth of the model).
+          // This prevents depth-direction cuts from creating pieces that appear as
+          // circular holes inside other pieces when viewed from the front.
+          const gridFor = s => [
+            Math.max(1, Math.round(worldSize.x * s)),
+            Math.max(1, Math.round(worldSize.y * s))
+          ];
+          let lo = 0.01, hi = 200;
+          for (let iter = 0; iter < 64; iter++) {
+            const mid = (lo + hi) / 2;
+            const [tx, ty] = gridFor(mid);
+            if (tx * ty <= targetPieces) lo = mid; else hi = mid;
+          }
+          const [lx, ly] = gridFor(lo), [hx, hy] = gridFor(hi);
+          const [nx, ny] = Math.abs(lx*ly - targetPieces) <= Math.abs(hx*hy - targetPieces)
+            ? [lx, ly] : [hx, hy];
+          const nz = 1;
+
+          // ── Tab/blank connector setup ────────────────────────────────────────
+          const cellW = worldSize.x / nx, cellH = worldSize.y / ny, cellD = worldSize.z;
+          const tabH = Math.min(cellW, cellH) * 0.28;  // bump height
+          const tabR = Math.min(cellW, cellH) * 0.32;  // bump radius
+
+          // Pass 1: find which cells actually contain model geometry (centroid-based).
+          // Tabs are only created on faces shared between two occupied cells, preventing
+          // blank recesses and spurious tab pieces on faces that border empty space.
+          const occupiedCells = new Set();
+          _masterModel.traverse(child => {
+            if (!child.isMesh) return;
+            child.updateWorldMatrix(true, false);
+            const posAttr = child.geometry.attributes.position;
+            const idx = child.geometry.index;
+            const triCount = idx ? idx.count / 3 : posAttr.count / 3;
+            const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+            for (let i = 0; i < triCount; i++) {
+              const ia = idx ? idx.getX(i*3)   : i*3;
+              const ib = idx ? idx.getX(i*3+1) : i*3+1;
+              const ic = idx ? idx.getX(i*3+2) : i*3+2;
+              va.fromBufferAttribute(posAttr, ia).applyMatrix4(child.matrixWorld);
+              vb.fromBufferAttribute(posAttr, ib).applyMatrix4(child.matrixWorld);
+              vc.fromBufferAttribute(posAttr, ic).applyMatrix4(child.matrixWorld);
+              const cx = Math.min(nx-1, Math.max(0, Math.floor(((va.x+vb.x+vc.x)/3 - worldBox.min.x) / cellW)));
+              const cy = Math.min(ny-1, Math.max(0, Math.floor(((va.y+vb.y+vc.y)/3 - worldBox.min.y) / cellH)));
+              const cz = Math.min(nz-1, Math.max(0, Math.floor(((va.z+vb.z+vc.z)/3 - worldBox.min.z) / cellD)));
+              occupiedCells.add(cx * ny * nz + cy * nz + cz);
+            }
+          });
+          const cellOccupied = (cx, cy, cz) => occupiedCells.has(cx * ny * nz + cy * nz + cz);
+
+          // tabFaces: keyed "axis:cx:cy:cz" — the face between that cell and its +axis neighbour
+          // Only created when BOTH adjacent cells have model geometry.
+          // h > 0: tab protrudes into +axis neighbour (blank on +axis side)
+          // h < 0: blank on this cell (+axis neighbour has the tab)
+          const tabFaces = new Map();
+          for (let cx = 0; cx < nx-1; cx++) for (let cy = 0; cy < ny; cy++) for (let cz = 0; cz < nz; cz++)
+            if (cellOccupied(cx,cy,cz) && cellOccupied(cx+1,cy,cz))
+              tabFaces.set(`0:${cx}:${cy}:${cz}`, { axis:0, uA:1, vA:2, val: worldBox.min.x+(cx+1)*cellW, uc: worldBox.min.y+(cy+.5)*cellH, vc: worldBox.min.z+(cz+.5)*cellD, r:tabR, h: tabH*(Math.random()<.5?1:-1) });
+          for (let cx = 0; cx < nx; cx++) for (let cy = 0; cy < ny-1; cy++) for (let cz = 0; cz < nz; cz++)
+            if (cellOccupied(cx,cy,cz) && cellOccupied(cx,cy+1,cz))
+              tabFaces.set(`1:${cx}:${cy}:${cz}`, { axis:1, uA:0, vA:2, val: worldBox.min.y+(cy+1)*cellH, uc: worldBox.min.x+(cx+.5)*cellW, vc: worldBox.min.z+(cz+.5)*cellD, r:tabR, h: tabH*(Math.random()<.5?1:-1) });
+          for (let cx = 0; cx < nx; cx++) for (let cy = 0; cy < ny; cy++) for (let cz = 0; cz < nz-1; cz++)
+            if (cellOccupied(cx,cy,cz) && cellOccupied(cx,cy,cz+1))
+              tabFaces.set(`2:${cx}:${cy}:${cz}`, { axis:2, uA:0, vA:1, val: worldBox.min.z+(cz+1)*cellD, uc: worldBox.min.x+(cx+.5)*cellW, vc: worldBox.min.y+(cy+.5)*cellH, r:tabR, h: tabH*(Math.random()<.5?1:-1) });
+
+          // Hemisphere displacement at a point on the cut face
+          function tabDisp(u, v, f) {
+            const du = u - f.uc, dv = v - f.vc, d2 = du*du + dv*dv;
+            return d2 >= f.r*f.r ? 0 : f.h * Math.sqrt(1 - d2/(f.r*f.r));
+          }
+
+          // Interpolate between two vertices
+          function lerpV(a, b, t) {
+            return {
+              p:  [a.p[0]+t*(b.p[0]-a.p[0]), a.p[1]+t*(b.p[1]-a.p[1]), a.p[2]+t*(b.p[2]-a.p[2])],
+              n:  a.n  ? [a.n[0]+t*(b.n[0]-a.n[0]),   a.n[1]+t*(b.n[1]-a.n[1]),   a.n[2]+t*(b.n[2]-a.n[2])]  : null,
+              uv: a.uv ? [a.uv[0]+t*(b.uv[0]-a.uv[0]), a.uv[1]+t*(b.uv[1]-a.uv[1])] : null
+            };
+          }
+
+          // Clip against a flat axis-aligned half-space
+          function clipFlat(poly, axis, val, keepGe) {
+            const out = [];
+            for (let i = 0; i < poly.length; i++) {
+              const a = poly[i], b = poly[(i+1)%poly.length];
+              const da = keepGe ? a.p[axis]-val : val-a.p[axis];
+              const db = keepGe ? b.p[axis]-val : val-b.p[axis];
+              if (da >= 0) out.push(a);
+              if ((da < 0) !== (db < 0)) out.push(lerpV(a, b, da/(da-db)));
+            }
+            return out;
+          }
+
+          // Clip against a tab/blank surface: axis = val + tabDisp(u,v)
+          // keepGe=true  → keep where axis >= surface  (blank side)
+          // keepGe=false → keep where axis <= surface  (tab side)
+          function clipTab(poly, f, keepGe) {
+            const sign = keepGe ? 1 : -1;
+            const out = [];
+            for (let i = 0; i < poly.length; i++) {
+              const a = poly[i], b = poly[(i+1)%poly.length];
+              const da = sign * (a.p[f.axis] - f.val - tabDisp(a.p[f.uA], a.p[f.vA], f));
+              const db = sign * (b.p[f.axis] - f.val - tabDisp(b.p[f.uA], b.p[f.vA], f));
+              if (da >= 0) out.push(a);
+              if ((da < 0) !== (db < 0)) {
+                // Bisect to find crossing parameter
+                let lo = 0, hi = 1;
+                for (let it = 0; it < 10; it++) {
+                  const m = (lo+hi)*0.5, pm = lerpV(a, b, m);
+                  const dm = sign * (pm.p[f.axis] - f.val - tabDisp(pm.p[f.uA], pm.p[f.vA], f));
+                  if ((da < 0) === (dm < 0)) lo = m; else hi = m;
+                }
+                out.push(lerpV(a, b, (lo+hi)*0.5));
+              }
+            }
+            return out;
+          }
+
+          // cellData: Map<cellKey, { mats, cx, cy, cz }>
+          const cellData = new Map();
+
+          _masterModel.updateMatrixWorld(true);
+          _masterModel.traverse(child => {
+            if (!child.isMesh) return;
+            child.updateWorldMatrix(true, false);
+            const geo = child.geometry;
+            const posAttr = geo.attributes.position;
+            const normalAttr = geo.attributes.normal;
+            const uvAttr = geo.attributes.uv;
+            const idx = geo.index;
+            const triCount = idx ? idx.count / 3 : posAttr.count / 3;
+            const normalMatrix = new THREE.Matrix3().getNormalMatrix(child.matrixWorld);
+            const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+            const na = new THREE.Vector3(), nb = new THREE.Vector3(), nc = new THREE.Vector3();
+            const hasN = !!normalAttr, hasUV = !!uvAttr;
+
+            for (let i = 0; i < triCount; i++) {
+              const ia = idx ? idx.getX(i*3)   : i*3;
+              const ib = idx ? idx.getX(i*3+1) : i*3+1;
+              const ic = idx ? idx.getX(i*3+2) : i*3+2;
+
+              va.fromBufferAttribute(posAttr, ia).applyMatrix4(child.matrixWorld);
+              vb.fromBufferAttribute(posAttr, ib).applyMatrix4(child.matrixWorld);
+              vc.fromBufferAttribute(posAttr, ic).applyMatrix4(child.matrixWorld);
+
+              let triMat = Array.isArray(child.material) ? child.material[0] : child.material;
+              if (Array.isArray(child.material) && geo.groups?.length) {
+                const fs = i * 3;
+                for (const grp of geo.groups) {
+                  if (fs >= grp.start && fs < grp.start + grp.count) { triMat = child.material[grp.materialIndex] || triMat; break; }
+                }
+              }
+
+              if (hasN) {
+                na.fromBufferAttribute(normalAttr, ia).applyMatrix3(normalMatrix).normalize();
+                nb.fromBufferAttribute(normalAttr, ib).applyMatrix3(normalMatrix).normalize();
+                nc.fromBufferAttribute(normalAttr, ic).applyMatrix3(normalMatrix).normalize();
+              }
+              const origPoly = [
+                { p:[va.x,va.y,va.z], n:hasN?[na.x,na.y,na.z]:null, uv:hasUV?[uvAttr.getX(ia),uvAttr.getY(ia)]:null },
+                { p:[vb.x,vb.y,vb.z], n:hasN?[nb.x,nb.y,nb.z]:null, uv:hasUV?[uvAttr.getX(ib),uvAttr.getY(ib)]:null },
+                { p:[vc.x,vc.y,vc.z], n:hasN?[nc.x,nc.y,nc.z]:null, uv:hasUV?[uvAttr.getX(ic),uvAttr.getY(ic)]:null }
+              ];
+
+              // Expand AABB by tabH so tab geometry reaching into adjacent cells is captured
+              const cxLo = Math.max(0,    Math.floor((Math.min(va.x,vb.x,vc.x)-worldBox.min.x-tabH)/cellW));
+              const cxHi = Math.min(nx-1, Math.floor((Math.max(va.x,vb.x,vc.x)-worldBox.min.x+tabH)/cellW));
+              const cyLo = Math.max(0,    Math.floor((Math.min(va.y,vb.y,vc.y)-worldBox.min.y-tabH)/cellH));
+              const cyHi = Math.min(ny-1, Math.floor((Math.max(va.y,vb.y,vc.y)-worldBox.min.y+tabH)/cellH));
+              const czLo = Math.max(0,    Math.floor((Math.min(va.z,vb.z,vc.z)-worldBox.min.z-tabH)/cellD));
+              const czHi = Math.min(nz-1, Math.floor((Math.max(va.z,vb.z,vc.z)-worldBox.min.z+tabH)/cellD));
+
+              for (let cx = cxLo; cx <= cxHi; cx++) {
+                for (let cy = cyLo; cy <= cyHi; cy++) {
+                  for (let cz = czLo; cz <= czHi; cz++) {
+                    // Clip to this cell using tab surfaces on shared faces, flat planes on boundary
+                    const fxL = tabFaces.get(`0:${cx-1}:${cy}:${cz}`), fxR = tabFaces.get(`0:${cx}:${cy}:${cz}`);
+                    const fyL = tabFaces.get(`1:${cx}:${cy-1}:${cz}`), fyR = tabFaces.get(`1:${cx}:${cy}:${cz}`);
+                    const fzL = tabFaces.get(`2:${cx}:${cy}:${cz-1}`), fzR = tabFaces.get(`2:${cx}:${cy}:${cz}`);
+
+                    let poly = origPoly;
+                    poly = fxL ? clipTab(poly, fxL, true)  : clipFlat(poly, 0, worldBox.min.x + cx*cellW,     true);  if (!poly.length) continue;
+                    poly = fxR ? clipTab(poly, fxR, false) : clipFlat(poly, 0, worldBox.min.x + (cx+1)*cellW, false); if (!poly.length) continue;
+                    poly = fyL ? clipTab(poly, fyL, true)  : clipFlat(poly, 1, worldBox.min.y + cy*cellH,     true);  if (!poly.length) continue;
+                    poly = fyR ? clipTab(poly, fyR, false) : clipFlat(poly, 1, worldBox.min.y + (cy+1)*cellH, false); if (!poly.length) continue;
+                    poly = fzL ? clipTab(poly, fzL, true)  : clipFlat(poly, 2, worldBox.min.z + cz*cellD,     true);  if (!poly.length) continue;
+                    poly = fzR ? clipTab(poly, fzR, false) : clipFlat(poly, 2, worldBox.min.z + (cz+1)*cellD, false); if (poly.length < 3) continue;
+
+                    const cellKey = cx * ny * nz + cy * nz + cz;
+                    // Skip cells that have no real model geometry (avoids spurious tab-bleed pieces)
+                    if (!occupiedCells.has(cellKey)) continue;
+                    if (!cellData.has(cellKey)) cellData.set(cellKey, { mats: new Map(), cx, cy, cz });
+                    const matMap = cellData.get(cellKey).mats;
+                    if (!matMap.has(triMat)) matMap.set(triMat, { positions: [], normals: [], uvs: [] });
+                    const data = matMap.get(triMat);
+
+                    for (let k = 1; k < poly.length - 1; k++) {
+                      const [a, b, c] = [poly[0], poly[k], poly[k+1]];
+                      data.positions.push(a.p[0],a.p[1],a.p[2], b.p[0],b.p[1],b.p[2], c.p[0],c.p[1],c.p[2]);
+                      if (a.n)  data.normals.push(a.n[0],a.n[1],a.n[2], b.n[0],b.n[1],b.n[2], c.n[0],c.n[1],c.n[2]);
+                      if (a.uv) data.uvs.push(a.uv[0],a.uv[1], b.uv[0],b.uv[1], c.uv[0],c.uv[1]);
+                    }
+                  }
+                }
+              }
+            }
+          });
+
+          // Build one Group per cell, one Mesh per material within that cell
+          // Use a local array — clearModel() resets the module-level pieces, so we
+          // assign to it only AFTER clearModel() is called below.
+          const builtPieces = [];
+          for (const [, cell] of cellData) {
+            const { mats: matMap, cx, cy, cz } = cell;
+            const pieceGroup = new THREE.Group();
+            pieceGroup.userData.gridCell = { x: cx, y: cy, z: cz };
+            for (const [mat, data] of matMap) {
+              const geo = new THREE.BufferGeometry();
+              geo.setAttribute('position', new THREE.Float32BufferAttribute(data.positions, 3));
+              if (data.normals.length) {
+                geo.setAttribute('normal', new THREE.Float32BufferAttribute(data.normals, 3));
+              } else {
+                geo.computeVertexNormals();
+              }
+              if (data.uvs.length) {
+                geo.setAttribute('uv', new THREE.Float32BufferAttribute(data.uvs, 2));
+              }
+              pieceGroup.add(new THREE.Mesh(geo, mat));
+            }
+            builtPieces.push(pieceGroup);
+          }
+
+          // Fisher-Yates shuffle
+          for (let i = builtPieces.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [builtPieces[i], builtPieces[j]] = [builtPieces[j], builtPieces[i]];
+          }
+
+
+          // Tag each piece with its array index and a unique snap group id
+          builtPieces.forEach((piece, i) => {
+            piece.userData.snapGroupId = i;
+            piece.traverse(child => { if (child.isMesh) child.userData.pieceIndex = i; });
+          });
+
+          // Find max piece extent to determine grid spacing
+          let maxExtent = 0;
+          for (const piece of builtPieces) {
+            const sz = new THREE.Vector3();
+            new THREE.Box3().setFromObject(piece).getSize(sz);
+            maxExtent = Math.max(maxExtent, sz.x, sz.y, sz.z);
+          }
+          const spacing = maxExtent * 1.4;
+
+          // Arrange pieces on a vertical XY wall — all at the same Z depth
+          const cols = Math.ceil(Math.sqrt(builtPieces.length));
+          const rows = Math.ceil(builtPieces.length / cols);
+          const rootGroup = new THREE.Group();
+
+          for (let i = 0; i < builtPieces.length; i++) {
+            const piece = builtPieces[i];
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+
+            // Centre piece on all axes
+            const center = new THREE.Vector3();
+            new THREE.Box3().setFromObject(piece).getCenter(center);
+            piece.userData.homeCenter = center.clone();
+            piece.position.sub(center);
+
+            // Place on the wall: X = column, Y = row, Z = 0 (same depth for all)
+            piece.position.x += (col - (cols - 1) / 2) * spacing;
+            piece.position.y += ((rows - 1 - row) - (rows - 1) / 2) * spacing; // top row first
+            piece.position.z = 0;
+
+            rootGroup.add(piece);
+          }
+
+          snapCellSize = Math.max(worldSize.x / nx, worldSize.y / ny, worldSize.z / nz);
+          snapThreshold = snapCellSize * 0.5;
+
+          // Remove master model from scene (it may have been re-added for matrix calc)
+          _xrPivot.remove(_masterModel);
+          clearModel(); // resets pieces=[] and mouseButtons — must come before we set them
+          pieces = builtPieces;
+          _pieceMeshes = null;
+          controls.mouseButtons = _puzzleMouseButtons;
+          _xrPivot.add(rootGroup);
+          loadedModel = rootGroup;
+
+          // Position camera directly in front of the wall (along +Z axis)
+          const gridBox = new THREE.Box3().setFromObject(rootGroup);
+          const gridSize = new THREE.Vector3();
+          gridBox.getSize(gridSize);
+          const gridCenter = new THREE.Vector3();
+          gridBox.getCenter(gridCenter);
+          const dist = Math.max(gridSize.x, gridSize.y) * 0.75;
+          camera.position.set(gridCenter.x, gridCenter.y, gridCenter.z + dist * 1.5);
+          camera.up.set(0, 1, 0);
+          controls.target.copy(new THREE.Vector3(gridCenter.x, gridCenter.y, 0));
+          controls.update();
+
+          setInfo(`Split into ${pieces.length} pieces. Left-click pans, right-click orbits. Enter VR to move pieces.`);
+        } catch (e) {
+          console.error(e);
+          showError('Error splitting model: ' + e.message);
+        }
+        showSpinner(false);
+      }, 50);
+    }
+
+    // ── Drag & Snap ──────────────────────────────────────────────────────────
+    const _dRay = new THREE.Raycaster();
+    const _dPlane = new THREE.Plane(); // recomputed per drag: faces camera, passes through piece
+    let _drag = null;
+    let _pieceMeshes = null;
+
+    function _buildMeshCache() {
+      _pieceMeshes = [];
+      pieces.forEach(p => p.traverse(c => { if (c.isMesh) _pieceMeshes.push(c); }));
+    }
+
+    function _raycastPiece(e) {
+      if (!pieces.length) return -1;
+      if (!_pieceMeshes) _buildMeshCache();
+      _dRay.setFromCamera(_ndcFromEvent(e), camera);
+      const hits = _dRay.intersectObjects(_pieceMeshes, false);
+      if (!hits.length) return -1;
+      const pi = hits[0].object.userData.pieceIndex;
+      return (pi !== undefined) ? pi : -1;
+    }
+
+    function _ndcFromEvent(e) {
+      const r = renderer.domElement.getBoundingClientRect();
+      return new THREE.Vector2(
+        ((e.clientX - r.left) / r.width)  *  2 - 1,
+        ((e.clientY - r.top)  / r.height) * -2 + 1
+      );
+    }
+
+    function _groupPieces(pi) {
+      const gid = pieces[pi].userData.snapGroupId;
+      return pieces.filter(p => p.userData.snapGroupId === gid);
+    }
+
+    function _mergeGroups(piA, piB) {
+      const gA = pieces[piA].userData.snapGroupId;
+      const gB = pieces[piB].userData.snapGroupId;
+      if (gA === gB) return;
+      pieces.forEach(p => { if (p.userData.snapGroupId === gB) p.userData.snapGroupId = gA; });
+    }
+
+    function _isAdjacentGroup(piA, piB) {
+      const groupA = _groupPieces(piA);
+      const groupB = _groupPieces(piB);
+      for (const a of groupA) {
+        const ca = a.userData.gridCell;
+        for (const b of groupB) {
+          const cb = b.userData.gridCell;
+          const dist = Math.abs(ca.x - cb.x) + Math.abs(ca.y - cb.y) + Math.abs(ca.z - cb.z);
+          if (dist === 1) return true;
+        }
+      }
+      return false;
+    }
+
+    function _checkSnap(pi) {
+      const dragged = pieces[pi];
+      const gid = dragged.userData.snapGroupId;
+      for (let i = 0; i < pieces.length; i++) {
+        if (pieces[i].userData.snapGroupId === gid) continue;
+        if (!_isAdjacentGroup(pi, i)) continue;
+        const dx = dragged.position.x - pieces[i].position.x;
+        const dy = dragged.position.y - pieces[i].position.y;
+        const dz = dragged.position.z - pieces[i].position.z;
+        if (Math.sqrt(dx*dx + dy*dy + dz*dz) < snapThreshold) {
+          const sx = pieces[i].position.x - dragged.position.x;
+          const sy = pieces[i].position.y - dragged.position.y;
+          const sz = pieces[i].position.z - dragged.position.z;
+          for (const p of _groupPieces(pi)) { p.position.x += sx; p.position.y += sy; p.position.z += sz; }
+          _playSound(_snapBuffer);
+          _mergeGroups(pi, i);
+          const gid0 = pieces[0].userData.snapGroupId;
+          if (pieces.every(p => p.userData.snapGroupId === gid0)) {
+            setInfo('Puzzle solved! All pieces assembled.');
+            _triggerFireworks();
+            _playSound(_cheerBuffer, 1.5);
+          }
+          return;
+        }
+      }
+    }
+
+    // Hover: cursor feedback only
+    renderer.domElement.addEventListener('pointermove', e => {
+      if (_drag) {
+        if (e.pointerId !== _drag.pointerId) return;
+        _dRay.setFromCamera(_ndcFromEvent(e), camera);
+        const pt = new THREE.Vector3();
+        if (!_dRay.ray.intersectPlane(_dPlane, pt)) return;
+        const dx = pt.x + _drag.offset.x - pieces[_drag.pieceIndex].position.x;
+        const dy = pt.y + _drag.offset.y - pieces[_drag.pieceIndex].position.y;
+        const dz = pt.z + _drag.offset.z - pieces[_drag.pieceIndex].position.z;
+        for (const p of _groupPieces(_drag.pieceIndex)) { p.position.x += dx; p.position.y += dy; p.position.z += dz; }
+        return;
+      }
+      if (renderer.xr.isPresenting) renderer.domElement.style.cursor = (_raycastPiece(e) >= 0) ? 'grab' : '';
+    });
+
+    // Left-click is reserved for piece dragging (controls.mouseButtons.LEFT = null in puzzle mode).
+    // OrbitControls will not claim left-click, so no listener ordering tricks are needed.
+    renderer.domElement.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || !pieces.length || !renderer.xr.isPresenting) return;
+      const pi = _raycastPiece(e);
+      if (pi < 0) return;
+      // Build a drag plane facing the camera, passing through the piece.
+      // Intersecting this plane maps pointer movement to all 3 world axes.
+      const camDir = new THREE.Vector3();
+      camera.getWorldDirection(camDir);
+      _dPlane.setFromNormalAndCoplanarPoint(camDir, pieces[pi].position);
+      const pt = new THREE.Vector3();
+      if (!_dRay.ray.intersectPlane(_dPlane, pt)) return;
+
+      _drag = { pieceIndex: pi, pointerId: e.pointerId,
+                offset: { x: pieces[pi].position.x - pt.x,
+                          y: pieces[pi].position.y - pt.y,
+                          z: pieces[pi].position.z - pt.z } };
+      renderer.domElement.setPointerCapture(e.pointerId);
+      renderer.domElement.style.cursor = 'grabbing';
+    });
+
+    renderer.domElement.addEventListener('pointerup', e => {
+      if (!_drag || e.pointerId !== _drag.pointerId) return;
+      renderer.domElement.releasePointerCapture(e.pointerId);
+      _checkSnap(_drag.pieceIndex);
+      _drag = null;
+      renderer.domElement.style.cursor = '';
+    });
+
+    renderer.domElement.addEventListener('pointercancel', e => {
+      if (!_drag || e.pointerId !== _drag.pointerId) return;
+      _drag = null;
+      renderer.domElement.style.cursor = '';
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Fireworks ─────────────────────────────────────────────────────────────
+    const _fwBursts = [];
+
+    function _spawnBurst(origin) {
+      const count = 180;
+      const pos = new Float32Array(count * 3);
+      const vel = new Float32Array(count * 3);
+      for (let j = 0; j < count; j++) {
+        pos[j * 3]     = origin.x;
+        pos[j * 3 + 1] = origin.y;
+        pos[j * 3 + 2] = origin.z;
+        const theta = Math.random() * Math.PI * 2;
+        const phi   = Math.acos(2 * Math.random() - 1);
+        const spd   = 1.2 + Math.random() * 2.0;
+        vel[j * 3]     = Math.sin(phi) * Math.cos(theta) * spd;
+        vel[j * 3 + 1] = Math.sin(phi) * Math.sin(theta) * spd;
+        vel[j * 3 + 2] = Math.cos(phi) * spd;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const mat = new THREE.PointsMaterial({
+        color: new THREE.Color().setHSL(Math.random(), 1.0, 0.65),
+        size: 0.07,
+        transparent: true,
+        opacity: 1.0,
+        depthWrite: false,
+      });
+      const pts = new THREE.Points(geo, mat);
+      scene.add(pts);
+      _fwBursts.push({ pts, pos, vel, life: 1.0 });
+    }
+
+    function _triggerFireworks() {
+      let t = 0;
+      for (let i = 0; i < 15; i++) {
+        setTimeout(() => {
+          _spawnBurst(new THREE.Vector3(
+            (Math.random() - 0.5) * 5,
+            (Math.random() - 0.5) * 3,
+            (Math.random() - 0.5) * 2
+          ));
+        }, t);
+        t += 250 + Math.random() * 300; // ~15 bursts over ~5 seconds
+      }
+    }
+
+    function _updateFireworks(delta) {
+      for (let i = _fwBursts.length - 1; i >= 0; i--) {
+        const fw = _fwBursts[i];
+        fw.life -= delta * 0.7;
+        if (fw.life <= 0) {
+          scene.remove(fw.pts);
+          fw.pts.geometry.dispose();
+          fw.pts.material.dispose();
+          _fwBursts.splice(i, 1);
+          continue;
+        }
+        const n = fw.pos.length / 3;
+        for (let j = 0; j < n; j++) {
+          fw.vel[j * 3 + 1] -= 1.5 * delta; // gravity
+          fw.pos[j * 3]     += fw.vel[j * 3]     * delta;
+          fw.pos[j * 3 + 1] += fw.vel[j * 3 + 1] * delta;
+          fw.pos[j * 3 + 2] += fw.vel[j * 3 + 2] * delta;
+        }
+        fw.pts.geometry.attributes.position.needsUpdate = true;
+        fw.pts.material.opacity = Math.max(0, fw.life);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    document.getElementById('splitBtn').addEventListener('click', () => {
+      const count = parseInt(document.getElementById('pieceCount').value, 10);
+      splitModel(count);
+    });
+
+    // ── Model selector ────────────────────────────────────────────────────────
+    const modelSelect = document.getElementById('modelSelect');
+
+    function populateModelSelect(files) {
+      modelSelect.innerHTML =
+        `<option value="__local__">Local</option>` +
+        files.map(f => `<option value="${f}">${f.replace('.fbx', '')}</option>`).join('');
+      if (files.length > 0) modelSelect.value = files[0];
+    }
+
+    function selectLocalModel() {
+      modelSelect.value = '__local__';
+    }
+
+    const _models = ['arabian-gate.fbx', 'maya-lintels.fbx'];
+    populateModelSelect(_models);
+    const _initial = _models[Math.floor(Math.random() * _models.length)];
+    modelSelect.value = _initial;
+    loadFBX(`models/${_initial}`, false, _initial);
+
+    modelSelect.addEventListener('change', () => {
+      const file = modelSelect.value;
+      if (file && file !== '__local__') loadFBX(`models/${file}`, false, file);
+    });
+
+    // ── WebXR (Quest 3 Touch Plus) ───────────────────────────────────────────
+    // One grab slot per controller (index 0 = right, 1 = left on Quest)
+    const _xrGrabs = [null, null];
+
+    // Reusable ray line visual for each controller
+    const _ctrlLineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
+    const _ctrlLineGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 0, -1)
+    ]);
+
+    const _xrControllers = [
+      renderer.xr.getController(0),
+      renderer.xr.getController(1)
+    ];
+
+    _xrControllers.forEach((ctrl, i) => {
+      // Ray line: points -Z (default controller forward)
+      const ray = new THREE.Line(_ctrlLineGeo, _ctrlLineMat);
+      ray.scale.z = 8;
+      ctrl.add(ray);
+      scene.add(ctrl);
+
+      ctrl.addEventListener('selectstart', () => {
+        if (!pieces.length) return;
+        if (!_pieceMeshes) _buildMeshCache();
+        const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+        const dir    = new THREE.Vector3(0, 0, -1).transformDirection(ctrl.matrixWorld).normalize();
+        _dRay.set(origin, dir);
+        const hits = _dRay.intersectObjects(_pieceMeshes, false);
+        if (!hits.length) return;
+        const pi = hits[0].object.userData.pieceIndex;
+        if (pi === undefined || pi < 0) return;
+
+        // Piece flies to 10 cm in front of the controller
+        const fwdOffset = new THREE.Vector3(0, 0, -1).transformDirection(ctrl.matrixWorld).normalize().multiplyScalar(0.1);
+        _xrGrabs[i] = { pieceIndex: pi, offset: fwdOffset };
+      });
+
+      ctrl.addEventListener('selectend', () => {
+        if (_xrGrabs[i] !== null) {
+          _checkSnap(_xrGrabs[i].pieceIndex);
+          _xrGrabs[i] = null;
+        }
+      });
+    });
+
+    function _updateXRGrabs() {
+      if (!renderer.xr.isPresenting) return;
+
+      // Thumbstick navigation — only when no piece is grabbed
+      const anyGrab = _xrGrabs.some(g => g !== null);
+      if (!anyGrab) {
+        const session = renderer.xr.getSession();
+        if (session) {
+          const moveSpeed = 0.02;
+          const rotSpeed  = 0.02;
+          for (const source of session.inputSources) {
+            if (!source.gamepad) continue;
+            const axes = source.gamepad.axes;
+            const tx = axes[2] ?? 0;
+            const ty = axes[3] ?? 0;
+            const dead = 0.15;
+            if (source.handedness === 'right') {
+              // Right thumbstick: rotate puzzle around Y, move up/down
+              if (Math.abs(tx) > dead) _xrPivot.rotation.y -= tx * rotSpeed;
+              if (Math.abs(ty) > dead) _xrPivot.position.y -= ty * moveSpeed;
+            } else {
+              // Left thumbstick: translate puzzle in world XZ
+              if (Math.abs(tx) > dead) _xrPivot.position.x += tx * moveSpeed;
+              if (Math.abs(ty) > dead) _xrPivot.position.z += ty * moveSpeed;
+            }
+          }
+        }
+      }
+
+      // Piece grabs — convert world-space target back to pivot-local space
+      _xrControllers.forEach((ctrl, i) => {
+        const grab = _xrGrabs[i];
+        if (!grab) return;
+        const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+        const worldTarget = origin.clone().add(grab.offset);
+        // Convert world → pivot-local directly from live position/quaternion,
+        // avoiding any matrixWorld staleness
+        const localTarget = worldTarget.clone()
+          .sub(_xrPivot.position)
+          .applyQuaternion(_xrPivot.quaternion.clone().invert());
+        // Target piece.position such that visual center (position + homeCenter) = localTarget
+        const hc = pieces[grab.pieceIndex].userData.homeCenter;
+        const fdx = (localTarget.x - hc.x) - pieces[grab.pieceIndex].position.x;
+        const fdy = (localTarget.y - hc.y) - pieces[grab.pieceIndex].position.y;
+        const fdz = (localTarget.z - hc.z) - pieces[grab.pieceIndex].position.z;
+        const t = (fdx*fdx + fdy*fdy + fdz*fdz) > 0.0001 ? 0.175 : 1.0;
+        const dx = fdx * t, dy = fdy * t, dz = fdz * t;
+        for (const p of _groupPieces(grab.pieceIndex)) {
+          p.position.x += dx; p.position.y += dy; p.position.z += dz;
+        }
+      });
+    }
+
+
+    // "Enter AR" button — tries immersive-ar (passthrough) first, falls back to immersive-vr
+    const xrBtn = document.getElementById('xrBtn');
+    let _xrSession = null;
+
+    xrBtn.addEventListener('click', async () => {
+      if (_xrSession) {
+        _xrSession.end();
+        return;
+      }
+      if (!navigator.xr) {
+        alert('WebXR is not available in this browser.');
+        return;
+      }
+      try {
+        const arSupported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+        const mode = arSupported ? 'immersive-ar' : 'immersive-vr';
+        const feats = arSupported
+          ? { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking'] }
+          : { requiredFeatures: ['local-floor'] };
+        _xrSession = await navigator.xr.requestSession(mode, feats);
+        renderer.xr.setReferenceSpaceType('local-floor');
+        await renderer.xr.setSession(_xrSession);
+        // Use transparent background in AR
+        if (arSupported) {
+          scene.background = null;
+          renderer.setClearColor(0x000000, 0);
+        }
+        // Position puzzle in front of and above the user:
+        // 2 m in front (-Z), 2.2 m high (above ~1.6 m eye level)
+        _xrPivot.position.set(0, 1.0, -4.0);
+        _xrPivot.rotation.set(0, 0, 0);
+
+        xrBtn.textContent = 'Exit AR';
+        xrBtn.style.background = '#b71c1c';
+        _xrSession.addEventListener('end', () => {
+          _xrSession = null;
+          xrBtn.textContent = 'Enter AR (Quest 3)';
+          xrBtn.style.background = '#e65100';
+          _xrPivot.position.set(0, 0, 0);
+          if (arSupported) {
+            scene.background = new THREE.Color(0x1b1b1b);
+            renderer.setClearColor(0x000000, 1);
+          }
+        });
+        setInfo('WebXR active — use triggers to grab and move pieces.');
+      } catch (e) {
+        console.error('XR session error:', e);
+        alert('Could not start XR session: ' + e.message);
+      }
+    });
+
+    // Hide the button if WebXR is definitely unavailable
+    if (!navigator.xr) {
+      xrBtn.style.display = 'none';
+    } else {
+      navigator.xr.isSessionSupported('immersive-ar')
+        .then(supported => { if (!supported) return navigator.xr.isSessionSupported('immersive-vr'); })
+        .then(supported => { if (supported === false) xrBtn.style.display = 'none'; })
+        .catch(() => {});
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Preload snap sound into Web Audio buffer for zero-latency playback
+    const _snapAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let _snapBuffer = null, _cheerBuffer = null;
+    fetch('sounds/snap.mp3').then(r => r.arrayBuffer()).then(buf => _snapAudioCtx.decodeAudioData(buf)).then(buf => { _snapBuffer = buf; }).catch(() => {});
+    fetch('sounds/crowd-cheering.mp3').then(r => r.arrayBuffer()).then(buf => _snapAudioCtx.decodeAudioData(buf)).then(buf => { _cheerBuffer = buf; }).catch(() => {});
+    function _playSound(buffer, gain = 1.0) {
+      if (!buffer) return;
+      if (_snapAudioCtx.state === 'suspended') _snapAudioCtx.resume();
+      const src = _snapAudioCtx.createBufferSource();
+      src.buffer = buffer;
+      if (gain !== 1.0) {
+        const gainNode = _snapAudioCtx.createGain();
+        gainNode.gain.value = gain;
+        src.connect(gainNode);
+        gainNode.connect(_snapAudioCtx.destination);
+      } else {
+        src.connect(_snapAudioCtx.destination);
+      }
+      src.start();
+    }
+
+    // Mute button
+    const _bgMusic = document.getElementById('bgMusic');
+    let _musicLoaded = false;
+    const muteBtn = document.getElementById('muteBtn');
+    muteBtn.addEventListener('click', () => {
+      if (!_musicLoaded) {
+        _bgMusic.src = 'music/backgroundmusic.mp3';
+        _bgMusic.play().catch(() => {});
+        _musicLoaded = true;
+      } else {
+        _bgMusic.muted = !_bgMusic.muted;
+        if (!_bgMusic.muted && _bgMusic.paused) _bgMusic.play().catch(() => {});
+      }
+      muteBtn.textContent = (!_musicLoaded || _bgMusic.muted) ? 'Play Music' : 'Mute Music';
+      muteBtn.style.background = (!_musicLoaded || _bgMusic.muted) ? '#546e7a' : '#37474f';
+    });
+
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => {
+      const delta = clock.getDelta();
+      controls.update(delta);
+      _updateXRGrabs();
+      _updateFireworks(delta);
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
